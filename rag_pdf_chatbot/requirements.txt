@@ -16,6 +16,7 @@ streamlit
 SpeechRecognition
 gTTS
 pygame
+PyAudio
 sounddevice
 soundfile
 Pillow
