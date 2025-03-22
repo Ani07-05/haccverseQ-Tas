@@ -1,6 +1,4 @@
 import streamlit as st
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
 from PyPDF2 import PdfReader
 import pandas as pd
 import base64
@@ -17,14 +15,10 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
 
 # For parsing resumes
 import docx2txt
 import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
 
 # Download NLTK resources
 try:
@@ -1966,7 +1960,6 @@ from gtts import gTTS
 from io import BytesIO
 from pygame import mixer
 import threading
-import queue
 import time
 import tempfile
 import os
