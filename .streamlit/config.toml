@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#39FF14"  # Neon green
+backgroundColor = "#121212"  # Dark mode background
+secondaryBackgroundColor = "#1E1E1E"  # Dark gray for secondary background
+textColor = "#FFFFFF"  # White for better contrast
+font = "monospace"
