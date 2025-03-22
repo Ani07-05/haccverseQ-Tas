@@ -9,7 +9,7 @@ import re
 import os
 import uuid
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Update imports for LangChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -39,10 +39,15 @@ except LookupError:
 
 # Load environment variables
 from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Initialize Groq client
+groq_client = Groq(api_key=GROQ_API_KEY)
 if not GEMINI_API_KEY:
     st.error(
         "GEMINI_API_KEY not found in environment variables. Please check your .env file."
@@ -376,126 +381,107 @@ def extract_education(text):
 
 
 def extract_experience(text):
-    """Extract years of experience from resume text considering date ranges with deduplication"""
-    from datetime import datetime
-    import calendar
+    """Enhanced experience calculation with accurate work day counting"""
 
-    # First check for explicit mentions of experience
-    experience_pattern = (
-        r"(\d+)[\+]?\s*(?:years|year|yr|yrs)(?:\s+of\s+experience|\s+experience)?"
-    )
-    explicit_matches = re.findall(experience_pattern, text, re.IGNORECASE)
+    def parse_date(date_str):
+        months = {
+            "jan": 1,
+            "feb": 2,
+            "mar": 3,
+            "apr": 4,
+            "may": 5,
+            "jun": 6,
+            "jul": 7,
+            "aug": 8,
+            "sep": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12,
+        }
 
-    total_months = 0
-    if explicit_matches:
-        # Sum all found experience years and convert to months
-        total_months = sum(int(year) * 12 for year in explicit_matches)
+        date_str = date_str.lower().strip()
+        parts = date_str.split()
 
-    # Now look for date ranges and track them to avoid double-counting
+        if len(parts) != 2:
+            return None
+
+        month_str = parts[0][:3]
+        year_str = parts[1]
+
+        if month_str not in months:
+            return None
+
+        try:
+            year = int(year_str)
+            month = months[month_str]
+            return datetime(year, month, 1)  # Return datetime object
+        except ValueError:
+            return None
+
+    # Store all date ranges to handle overlaps
     date_ranges = []
+    dates_found = False
 
-    # Pattern for "Month Year - Month Year"
-    date_range_pattern1 = r"([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*([A-Za-z]+)\s+(\d{4})"
-    # Pattern for "Month Year - Present"
-    date_range_pattern2 = r"([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*(Present|Current|Now)"
-    # Pattern for single month mentions like "Mar 2025"
-    date_single_pattern = r"(?:^|\s|,|\()([A-Za-z]+)\s+(\d{4})(?:\s|$|,|\))"
+    # Look for date ranges with months
+    date_pattern = r"([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*([A-Za-z]+)\s+(\d{4})|([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*(Present|Current|Now)"
 
-    # Helper function to convert month name to number
-    def month_to_num(month_name):
-        month_name = month_name.strip().capitalize()
-        if len(month_name) >= 3:
-            # Try full month name
-            try:
-                return list(calendar.month_name).index(month_name)
-            except ValueError:
-                # Try abbreviated month name
-                try:
-                    for i, month in enumerate(calendar.month_name):
-                        if month and month.startswith(month_name[:3]):
-                            return i
-                    # Direct abbreviation match
-                    return list(calendar.month_abbr).index(month_name[:3])
-                except ValueError:
-                    return 1  # Default to January if we can't parse
-        return 1  # Default to January for short month names
+    for match in re.finditer(date_pattern, text):
+        dates_found = True
+        start_date = None
+        end_date = None
 
-    # Get the current date for "Present" calculations
-    current_date = datetime.now()
+        if match.group(7):  # Present date format
+            start_month = match.group(5)
+            start_year = match.group(6)
+            start_date = parse_date(f"{start_month} {start_year}")
+            end_date = datetime.now()
+        else:  # Full date range format
+            start_month, start_year = match.group(1), match.group(2)
+            end_month, end_year = match.group(3), match.group(4)
 
-    # Process "Month Year - Month Year" date ranges
-    for match in re.finditer(date_range_pattern1, text):
-        start_month, start_year, end_month, end_year = match.groups()
-        try:
-            start_date = datetime(int(start_year), month_to_num(start_month), 1)
-            end_date = datetime(int(end_year), month_to_num(end_month), 28)
+            start_date = parse_date(f"{start_month} {start_year}")
+            end_date = parse_date(f"{end_month} {end_year}")
 
-            # Store as tuple of (start_date, end_date)
+        if start_date and end_date and start_date < end_date:
             date_ranges.append((start_date, end_date))
-        except (ValueError, TypeError):
-            continue
 
-    # Process "Month Year - Present" date ranges
-    for match in re.finditer(date_range_pattern2, text):
-        start_month, start_year, _ = match.groups()
-        try:
-            start_date = datetime(int(start_year), month_to_num(start_month), 1)
+    # If no proper date ranges found, return None
+    if not dates_found:
+        return None
 
-            # Store as tuple of (start_date, current_date)
-            date_ranges.append((start_date, current_date))
-        except (ValueError, TypeError):
-            continue
+    # Sort date ranges by start date
+    date_ranges.sort(key=lambda x: x[0])
 
-    # Process single month mentions (assume 1 month duration)
-    for match in re.finditer(date_single_pattern, text):
-        month, year = match.groups()
-        try:
-            date = datetime(int(year), month_to_num(month), 15)  # Middle of month
+    # Merge overlapping ranges
+    merged_ranges = []
+    for start, end in date_ranges:
+        if not merged_ranges or start > merged_ranges[-1][1]:
+            merged_ranges.append((start, end))
+        else:
+            # Extend the last range if there's overlap
+            merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], end))
 
-            # Store as tuple of (date, date + 1 month)
-            end_date = datetime(
-                date.year + (date.month // 12), ((date.month % 12) + 1) or 12, 15
-            )
-            date_ranges.append((date, end_date))
-        except (ValueError, TypeError):
-            continue
+    # Calculate total days excluding weekends
+    total_days = 0
+    for start, end in merged_ranges:
+        delta = end - start
+        weeks = delta.days // 7
+        remaining_days = delta.days % 7
 
-    # If we found date ranges, calculate non-overlapping experience
-    if date_ranges:
-        # Sort by start date
-        date_ranges.sort(key=lambda x: x[0])
+        # Count weekdays in complete weeks (5 days per week)
+        weekdays = weeks * 5
 
-        # Merge overlapping date ranges
-        merged_ranges = []
-        for current_range in date_ranges:
-            if not merged_ranges:
-                merged_ranges.append(current_range)
-                continue
+        # Add remaining days, excluding weekends
+        for i in range(remaining_days):
+            day = (start + timedelta(weeks * 7 + i)).weekday()
+            if day < 5:  # Monday = 0, Friday = 4
+                weekdays += 1
 
-            last_start, last_end = merged_ranges[-1]
-            current_start, current_end = current_range
+        total_days += weekdays
 
-            # Check if current range overlaps with the last merged range
-            if current_start <= last_end:
-                # Merge by extending the end date if needed
-                merged_ranges[-1] = (last_start, max(last_end, current_end))
-            else:
-                # No overlap, add as new range
-                merged_ranges.append(current_range)
-
-        # Calculate total months from merged ranges
-        for start_date, end_date in merged_ranges:
-            months_diff = (
-                (end_date.year - start_date.year) * 12
-                + end_date.month
-                - start_date.month
-            )
-            total_months += max(1, months_diff)  # Ensure at least 1 month per entry
-
-    # Convert total months to years with 1 decimal place
-    total_years = round(total_months / 12, 1)
-
-    return total_years
+    # Convert work days to years (52 weeks * 5 workdays = 260 workdays per year)
+    years = round(total_days / 260, 1)
+    return years
 
 
 def extract_email(text):
@@ -664,16 +650,17 @@ def generate_concept_questions(
 
     # Create prompt with context
     prompt = f"""
-    Generate {num_questions} {difficulty.lower()} {language} programming concept interview questions.
+    Generate {num_questions} {difficulty.lower()} {language} programming concept questions.
+    
+    Requirements:
+    1. Each question must be 30 words or less
+    2. Provide answers in bullet points (max 5 points)
+    3. Each point should be clear and concise
+    4. Include one follow-up question (15 words max)
     
     Consider that candidates also have these skills: {', '.join(relevant_skills[:5])}
     
-    For each question, provide:
-    1. A detailed question that tests deep understanding, not just facts
-    2. An expert-level answer that demonstrates mastery
-    3. A thoughtful follow-up question to probe deeper
-    
-    Return the results as a JSON array where each item has 'question', 'answer', and 'follow_up' keys.
+    Return as JSON array with 'question', 'answer', and 'follow_up' keys.
     """
 
     response = model.invoke(prompt)
@@ -1064,6 +1051,97 @@ def extract_domain_specific_experience(content, domain):
     return final_score
 
 
+def validate_experience_format(text):
+    """Validate experience format and return validation results"""
+    is_valid = True
+    errors = []
+
+    # Required format pattern
+    date_pattern = r"([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*([A-Za-z]+)\s+(\d{4})|([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*(Present|Current|Now)"
+
+    # Find all experience date ranges
+    matches = re.finditer(date_pattern, text)
+    dates = []
+
+    for match in matches:
+        if match.group(7):  # Present date format
+            month = match.group(5)
+            year = match.group(6)
+            if not month or not year:
+                is_valid = False
+                errors.append("Missing month or year in experience dates")
+                continue
+            dates.append((month, int(year), "Present"))
+        else:
+            start_month = match.group(1)
+            start_year = match.group(2)
+            end_month = match.group(3)
+            end_year = match.group(4)
+
+            if not all([start_month, start_year, end_month, end_year]):
+                is_valid = False
+                errors.append("Missing month or year in experience dates")
+                continue
+
+            dates.append((start_month, int(start_year), end_month, int(end_year)))
+
+    if not dates:
+        is_valid = False
+        errors.append("No properly formatted experience dates found")
+        return is_valid, errors
+
+    # Check chronological order
+    for i in range(len(dates) - 1):
+        curr_end_year = dates[i][3] if len(dates[i]) == 4 else datetime.now().year
+        next_start_year = dates[i + 1][1]
+
+        if curr_end_year > next_start_year:
+            is_valid = False
+            errors.append("Experience dates not in chronological order")
+            break
+
+    # Check for valid months
+    valid_months = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "may",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "oct",
+        "nov",
+        "dec",
+    ]
+
+    for date in dates:
+        if date[0].lower() not in valid_months:
+            is_valid = False
+            errors.append(f"Invalid month format: {date[0]}")
+            break
+
+        if len(date) == 4 and date[2].lower() not in valid_months:
+            is_valid = False
+            errors.append(f"Invalid month format: {date[2]}")
+            break
+
+    return is_valid, errors
+
+
 def parse_resume(file, content):
     """Parse resume content into structured data with enhanced domain awareness"""
     # Extract standard information
@@ -1142,6 +1220,9 @@ def parse_resume(file, content):
     ):
         context["education_level"] = "Bachelor"
 
+    # Validate experience format
+    is_valid_format, format_errors = validate_experience_format(content)
+
     parsed_data = {
         "filename": file.name,
         "name": name,
@@ -1154,6 +1235,8 @@ def parse_resume(file, content):
         "positions": positions,
         "context": context,
         "domain_scores": domain_scores,
+        "is_valid_format": is_valid_format,
+        "format_errors": format_errors,
         "content": (
             content[:1000] + "..." if len(content) > 1000 else content
         ),  # Truncate content for display
@@ -1259,7 +1342,7 @@ def extract_cgpa(text):
         r"(?:CGPA|GPA)[\s:-]+(\d+\.?\d*)/\d+\.?\d*",
         r"(?:with|scored|secured|obtained)[\s]+(?:a\s+)?(?:CGPA|GPA)[\s:]+(\d+\.?\d*)",
     ]
-    
+
     for pattern in cgpa_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
@@ -1273,19 +1356,72 @@ def extract_cgpa(text):
                 continue
     return None
 
+
 def parse_query_conditions(query):
-    """Parse query to identify logical conditions"""
+    """Enhanced query parsing with improved XOR detection"""
     conditions = {
         "negative": [],
         "and_conditions": [],
         "or_conditions": [],
-        "cgpa_condition": None,
-        "percentile_threshold": 75  # Default percentile threshold
+        "xor_conditions": [],
+        "experience_ranges": [],
+        "cgpa_condition": None,  # Initialize with None
+        "percentile_threshold": 75,
     }
-    
-    # Convert query to lowercase for easier matching
+
+    # Normalize query by handling "no experience" cases
     query_lower = query.lower()
-    
+    query_lower = query_lower.replace("no experience in", "without")
+    query_lower = query_lower.replace("no experience with", "without")
+    query_lower = query_lower.replace("no", "without")
+
+    # Enhanced XOR patterns to catch more variations
+    xor_patterns = [
+        r"(?:either\s+)?(\w+)\s+or\s+(\w+)\s+(?:but\s+)?not\s+both",
+        r"(\w+)\s+xor\s+(\w+)",
+        r"(?:either\s+)?(\w+)\s+or\s+(\w+)\s+exclusively",
+        r"(?:only\s+)?(?:one\s+of\s+)?(\w+)\s+or\s+(\w+)",
+    ]
+
+    query_lower = query.lower()
+    # Remove noise words that might interfere with pattern matching
+    query_lower = query_lower.replace("experience with", "")
+    query_lower = query_lower.replace("experience in", "")
+    query_lower = query_lower.replace("experienced in", "")
+
+    for pattern in xor_patterns:
+        matches = re.findall(pattern, query_lower)
+        if matches:
+            terms = matches[0]
+            # Clean up the terms
+            terms = [term.strip() for term in terms]
+            conditions["xor_conditions"].extend(terms)
+            break  # Use only the first matching XOR condition
+
+    # Extract experience ranges
+    range_patterns = [
+        r"(\d+)(?:-|\s+to\s+)(\d+)\s*(?:years?|yrs?)",
+        r"between\s+(\d+)\s+and\s+(\d+)\s*(?:years?|yrs?)",
+    ]
+
+    for pattern in range_patterns:
+        matches = re.findall(pattern, query_lower)
+        for start, end in matches:
+            conditions["experience_ranges"].append((float(start), float(end)))
+
+    # Handle excluding experience ranges
+    exclude_patterns = [
+        r"excluding\s+(\d+)(?:-|\s+to\s+)(\d+)\s*(?:years?|yrs?)",
+        r"except\s+(\d+)(?:-|\s+to\s+)(\d+)\s*(?:years?|yrs?)",
+    ]
+
+    for pattern in exclude_patterns:
+        matches = re.findall(pattern, query_lower)
+        for start, end in matches:
+            conditions["experience_ranges"].append(
+                (-float(end), -float(start))
+            )  # Negative ranges indicate exclusion
+
     # Check for negative conditions
     no_patterns = [
         r"no\s+(\w+)\s+experience",
@@ -1295,51 +1431,87 @@ def parse_query_conditions(query):
     for pattern in no_patterns:
         matches = re.findall(pattern, query_lower)
         conditions["negative"].extend(matches)
-    
+
     # Check for AND conditions
     if "and" in query_lower or "both" in query_lower:
         and_pattern = r"(?:both\s+)?(\w+)\s+and\s+(\w+)"
         matches = re.findall(and_pattern, query_lower)
         for match in matches:
             conditions["and_conditions"].extend(match)
-    
+
     # Check for OR conditions
     if "or" in query_lower:
         or_pattern = r"(\w+)\s+or\s+(\w+)"
         matches = re.findall(or_pattern, query_lower)
         for match in matches:
             conditions["or_conditions"].extend(match)
-    
+
     # Check for CGPA conditions
     cgpa_pattern = r"(?:cgpa|gpa)\s*(>=|>|<=|<|=)\s*(\d+\.?\d*)"
     cgpa_matches = re.findall(cgpa_pattern, query_lower)
     if cgpa_matches:
         operator, value = cgpa_matches[0]
         conditions["cgpa_condition"] = (operator, float(value))
-    
+
     # Check for percentile threshold
     threshold_pattern = r"top\s+(\d+)(?:%|\s*percent)"
     threshold_matches = re.findall(threshold_pattern, query_lower)
     if threshold_matches:
         conditions["percentile_threshold"] = int(threshold_matches[0])
-    
+
     return conditions
 
+
 def filter_resumes_by_conditions(parsed_resumes, conditions):
-    """Filter resumes based on parsed conditions"""
+    """Enhanced resume filtering with strict XOR handling"""
     filtered_resumes = []
-    
+
     for resume in parsed_resumes:
         matches_conditions = True
         content_lower = resume["content"].lower()
         skills_lower = [s.lower() for s in resume.get("skills", [])]
-        
+
+        # Handle XOR conditions with strict checking
+        if conditions["xor_conditions"]:
+            term1, term2 = conditions["xor_conditions"]
+            has_term1 = (
+                any(term1.lower() in skill for skill in skills_lower)
+                or term1.lower() in content_lower
+            )
+            has_term2 = (
+                any(term2.lower() in skill for skill in skills_lower)
+                or term2.lower() in content_lower
+            )
+
+            # True XOR: must have exactly one but not both
+            if not (has_term1 != has_term2):  # XOR operation
+                matches_conditions = False
+                continue  # Skip this resume if it doesn't meet XOR condition
+
+        # Handle experience ranges
+        if conditions["experience_ranges"] and resume["experience_years"]:
+            exp_years = resume["experience_years"]
+            in_range = False
+
+            for start, end in conditions["experience_ranges"]:
+                if start < 0:  # Exclusion range
+                    if -end <= exp_years <= -start:
+                        matches_conditions = False
+                        break
+                else:  # Inclusion range
+                    if start <= exp_years <= end:
+                        in_range = True
+                        break
+
+            if conditions["experience_ranges"] and not in_range:
+                matches_conditions = False
+
         # Check negative conditions
         for neg_term in conditions["negative"]:
             if neg_term.lower() in content_lower or neg_term.lower() in skills_lower:
                 matches_conditions = False
                 break
-        
+
         # Check AND conditions
         if conditions["and_conditions"]:
             matches_and = all(
@@ -1347,7 +1519,7 @@ def filter_resumes_by_conditions(parsed_resumes, conditions):
                 for term in conditions["and_conditions"]
             )
             matches_conditions = matches_conditions and matches_and
-        
+
         # Check OR conditions
         if conditions["or_conditions"]:
             matches_or = any(
@@ -1355,9 +1527,9 @@ def filter_resumes_by_conditions(parsed_resumes, conditions):
                 for term in conditions["or_conditions"]
             )
             matches_conditions = matches_conditions and matches_or
-        
-        # Check CGPA condition
-        if conditions["cgpa_condition"]:
+
+        # Check CGPA condition - only if it exists
+        if conditions.get("cgpa_condition"):  # Use .get() to safely access
             cgpa = extract_cgpa(resume["content"])
             if cgpa:
                 operator, value = conditions["cgpa_condition"]
@@ -1366,66 +1538,94 @@ def filter_resumes_by_conditions(parsed_resumes, conditions):
                     ">": cgpa > value,
                     "<=": cgpa <= value,
                     "<": cgpa < value,
-                    "=": cgpa == value
+                    "=": cgpa == value,
                 }[operator]
                 matches_conditions = matches_conditions and matches_cgpa
             else:
                 matches_conditions = False
-        
+
         if matches_conditions:
             filtered_resumes.append(resume)
-    
+
     return filtered_resumes
+
 
 def apply_percentile_threshold(results, threshold):
     """Apply percentile threshold to results"""
     if not results:
         return results
-    
+
     # Calculate scores
     scores = [r["match_score"] for r in results]
     threshold_score = np.percentile(scores, threshold)
-    
+
     # Filter results above threshold
-    filtered_results = [
-        r for r in results 
-        if r["match_score"] >= threshold_score
-    ]
-    
+    filtered_results = [r for r in results if r["match_score"] >= threshold_score]
+
     return filtered_results
 
+
 def get_gemini_response(api_key, query, parsed_resumes, num_results=5, filters=None):
-    """Get response from Gemini model with enhanced logical conditions"""
-    # Parse query conditions
-    conditions = parse_query_conditions(query)
-    
+    """Get response with handling of badly formatted resumes"""
+    # Separate valid and invalid resumes
+    valid_resumes = []
+    invalid_resumes = []
+
+    for resume in parsed_resumes:
+        if resume.get("is_valid_format", True):
+            valid_resumes.append(resume)
+        else:
+            invalid_resumes.append(
+                {
+                    "name": resume.get("name", "Unknown"),
+                    "filename": resume.get("filename", ""),
+                    "format_errors": resume.get(
+                        "format_errors", ["Unknown formatting error"]
+                    ),
+                    "content": resume.get("content", ""),
+                }
+            )
+
+    # Process only valid resumes for search
+    filtered_resumes = filter_resumes_by_conditions(
+        valid_resumes, parse_query_conditions(query)
+    )
+
     # Detect if query contains domain-specific keywords
     detected_domain = None
     domain_keywords = {
         "cybersecurity": ["security", "cyber", "hacking", "firewall", "vulnerability"],
-        "data_science": ["data science", "machine learning", "ai", "analytics", "statistics"],
+        "data_science": [
+            "data science",
+            "machine learning",
+            "ai",
+            "analytics",
+            "statistics",
+        ],
         "web_development": ["web", "frontend", "backend", "full stack", "javascript"],
-        "mobile_development": ["mobile", "android", "ios", "app", "flutter"]
+        "mobile_development": ["mobile", "android", "ios", "app", "flutter"],
     }
-    
+
     # Check if any domain keywords are in the query
     query_lower = query.lower()
     for domain, keywords in domain_keywords.items():
         if any(keyword in query_lower for keyword in keywords):
             detected_domain = domain
             break
-    
+
     # Apply logical filters first
-    filtered_resumes = filter_resumes_by_conditions(parsed_resumes, conditions)
-    
+    filtered_resumes = filter_resumes_by_conditions(
+        parsed_resumes, parse_query_conditions(query)
+    )
+
     # If no resumes match the logical conditions, return empty results
     if not filtered_resumes:
         return {
             "summary": "No candidates match the specified criteria.",
             "results": [],
-            "query": query
+            "query": query,
         }
-    
+
     # Continue with existing similarity search on filtered resumes
     # Create embeddings for the query
     embeddings = GoogleGenerativeAIEmbeddings(
@@ -1479,30 +1679,80 @@ def get_gemini_response(api_key, query, parsed_resumes, num_results=5, filters=N
     for idx, score_data in top_resumes:
         resume = filtered_resumes[idx]
 
-        # Calculate an adjusted match score that combines similarity and domain relevance
-        similarity_score = (
-            1 - score_data["score"]
-        ) * 100  # Convert to percentage (higher is better)
-        domain_score = resume.get("domain_relevance", 0) * 100 if detected_domain else 0
+        # Calculate different scoring components
+        # 1. Similarity score (from vector search) - normalized to 0-100
+        similarity_score = 100 - min(100, score_data["score"] * 100)
 
-        # Weighted combination (70% similarity, 30% domain relevance)
-        adjusted_score = (0.7 * similarity_score) + (0.3 * domain_score)
+        # 2. Skills match score
+        query_terms = set(query.lower().split())
+        skills = set(s.lower() for s in resume["skills"])
+        skills_match = (
+            len(query_terms.intersection(skills)) / len(query_terms) * 100
+            if query_terms
+            else 0
+        )
+
+        # 3. Experience relevance score
+        exp_score = (
+            min(100, resume["experience_years"] * 10)
+            if resume["experience_years"]
+            else 0
+        )
+
+        # 4. Education score
+        education_score = 0
+        education_texts = [edu.lower() for edu in resume["education"]]
+        if any("phd" in edu or "doctorate" in edu for edu in education_texts):
+            education_score = 100
+        elif any("master" in edu for edu in education_texts):
+            education_score = 85
+        elif any(
+            "bachelor" in edu or "b.tech" in edu or "b.e." in edu
+            for edu in education_texts
+        ):
+            education_score = 70
+
+        # 5. Position/role match score
+        positions = " ".join([p["title"].lower() for p in resume.get("positions", [])])
+        position_match = any(term in positions for term in query_terms) * 100
+
+        # Calculate weighted final score
+        weights = {
+            "similarity": 0.3,
+            "skills": 0.25,
+            "experience": 0.2,
+            "education": 0.15,
+            "position": 0.1,
+        }
+
+        adjusted_score = (
+            similarity_score * weights["similarity"]
+            + skills_match * weights["skills"]
+            + exp_score * weights["experience"]
+            + education_score * weights["education"]
+            + position_match * weights["position"]
+        )
+
+        # Ensure score is between 0 and 100
+        final_score = max(0, min(100, adjusted_score))
 
         result = {
-            "id": str(uuid.uuid4()),  # Generate a unique ID
+            "id": str(uuid.uuid4()),
             "name": resume["name"],
             "filename": resume["filename"],
             "email": resume["email"],
             "phone": resume["phone"],
             "skills": resume["skills"],
-            "domain_skills": resume.get("domain_skills", {}),
             "education": resume["education"],
             "experience_years": resume["experience_years"],
-            "positions": resume.get("positions", []),
-            "match_score": float(adjusted_score),
-            "domain_relevance": float(domain_score),
-            "highlights": score_data["highlights"],
-            "context": resume.get("context", {}),
+            "match_score": final_score,
+            "score_components": {
+                "similarity": similarity_score,
+                "skills_match": skills_match,
+                "experience": exp_score,
+                "education": education_score,
+                "position_match": position_match,
+            },
         }
         results.append(result)
 
@@ -1703,13 +1953,498 @@ def get_gemini_response(api_key, query, parsed_resumes, num_results=5, filters=N
             "summary": "Found matching candidates based on your query.",
             "results": results,
             "query": query,
+            "badly_formatted_resumes": {
+                "count": len(invalid_resumes),
+                "resumes": invalid_resumes,
+            },
         }
+
+
+import google.generativeai as genai
+import speech_recognition as sr
+from gtts import gTTS
+from io import BytesIO
+from pygame import mixer
+import threading
+import queue
+import time
+import tempfile
+import os
+import sounddevice as sd
+import soundfile as sf
+
+import base64
+from PIL import Image, ImageDraw, ImageFont
+import io
+
+
+def encode_image(image_path):
+    """Convert image to base64"""
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
+
+def analyze_resume_with_vision(resume_content, candidate_info):
+    """Analyze resume using Gemini Vision"""
+    # Convert text content to image
+    image = Image.new("RGB", (800, 1000), color="white")
+    d = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        font = None
+    d.text((20, 20), resume_content, fill="black", font=font)
+
+    # Save temp image
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format="PNG")
+    img_byte_arr = img_byte_arr.getvalue()
+
+    # Create vision prompt
+    vision_prompt = f"""Analyze this candidate's resume:
+    Name: {candidate_info['name']}
+    Match Score: {candidate_info['match_score']:.2f}%
+    
+    Provide a detailed analysis with the following sections:
+    1. Executive Summary
+    2. Technical Skills Assessment
+    3. Experience Analysis
+    4. Education & Certifications
+    5. Interview Focus Areas
+    6. Final Recommendation
+    """
+
+    try:
+        # Use Gemini Vision
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content([vision_prompt, img_byte_arr])
+        return response.text
+    except Exception as e:
+        return f"Error analyzing resume: {str(e)}"
+
+
+def play_audio_response(text, max_duration=30):
+    """Convert text to speech and play with duration limit"""
+    try:
+        # Split long text into chunks of ~500 characters
+        chunks = [text[i : i + 500] for i in range(0, len(text), 500)]
+
+        for chunk in chunks:
+            # Create temp audio file
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                audio_file = temp_file.name
+                tts = gTTS(text=chunk, lang="en")
+                tts.save(audio_file)
+
+                # Initialize pygame mixer if needed
+                if not mixer.get_init():
+                    mixer.init()
+
+                # Load and play audio
+                mixer.music.load(audio_file)
+                mixer.music.play()
+
+                # Wait for playback with timeout
+                start_time = time.time()
+                while mixer.music.get_busy():
+                    if time.time() - start_time > max_duration:
+                        mixer.music.stop()
+                        break
+                    time.sleep(0.1)
+
+                # Cleanup
+                mixer.music.unload()
+                try:
+                    os.remove(audio_file)
+                except Exception:
+                    pass
+
+        mixer.quit()
+
+    except Exception as e:
+        st.error(f"Error playing audio: {str(e)}")
+
+
+def voice_chat_interface():
+    st.title("Voice Resume Chat")
+
+    # Resume selector
+    if "parsed_resumes" in st.session_state and st.session_state.parsed_resumes:
+        resume_options = [
+            f"{r['name']} - {r['filename']}" for r in st.session_state.parsed_resumes
+        ]
+        resume_options.insert(0, "General Chat (No Resume)")
+
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            selected_idx = st.selectbox(
+                "Select Resume:",
+                range(len(resume_options)),
+                format_func=lambda x: resume_options[x],
+            )
+
+            if st.button("🎤 Ask Question"):
+                with st.spinner("Listening..."):
+                    try:
+                        # Record and transcribe
+                        _ = record_audio(duration=7)
+                        user_text = speech_to_text()
+
+                        if user_text:
+                            st.text(f"You asked: {user_text}")
+
+                            # Get resume context if selected
+                            if selected_idx > 0:
+                                resume = st.session_state.parsed_resumes[
+                                    selected_idx - 1
+                                ]
+                                context = f"""
+                                Analyzing resume for: {resume['name']}
+                                Experience: {resume['experience_years']} years
+                                Skills: {', '.join(resume['skills'])}
+                                Education: {'; '.join(resume['education'])}
+                                Query: {user_text}
+                                """
+                            else:
+                                context = user_text
+
+                            # Generate response
+                            model = genai.GenerativeModel("gemini-1.5-pro")
+                            response = model.generate_content(context)
+                            ai_response = response.text
+
+                            # Store response and play audio
+                            st.session_state.last_response = ai_response
+                            play_audio_response(ai_response)
+
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+
+        with col2:
+            if selected_idx > 0:
+                resume = st.session_state.parsed_resumes[selected_idx - 1]
+                st.subheader("Resume Preview")
+                st.write(f"**Name:** {resume['name']}")
+                st.write(f"**Experience:** {resume['experience_years']} years")
+                st.write("**Skills:**", ", ".join(resume["skills"]))
+                st.write("**Education:**")
+                for edu in resume["education"]:
+                    st.write(f"- {edu}")
+
+                with st.expander("View Full Resume"):
+                    st.text(resume["content"])
+
+    else:
+        st.warning("Please upload and process resumes in the Resume Search tab first.")
+
+    # Display last response
+    if "last_response" in st.session_state:
+        st.markdown("---")
+        st.subheader("AI Response:")
+        st.write(st.session_state.last_response)
+
+
+def record_audio(duration=5, sample_rate=16000):
+    """Record audio from microphone"""
+    recording = sd.rec(
+        int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype="float32"
+    )
+    sd.wait()
+
+    # Save to temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        sf.write(f.name, recording, sample_rate)
+        return f.name
+
+
+def transcribe_audio(audio_file):
+    """Transcribe audio using Groq Whisper"""
+    with open(audio_file, "rb") as f:
+        transcription = groq_client.audio.transcriptions.create(
+            file=(audio_file, f.read()),
+            model="llama-3.3-70b-versatile",
+            response_format="text",
+            language="en",
+        )
+
+    # Handle different possible response formats
+    if isinstance(transcription, str):
+        return transcription
+    elif hasattr(transcription, "text"):
+        return transcription.text
+    else:
+        return str(transcription)  # Fallback to string representation
+
+
+def voice_assistant_analysis(api_key, result_data):
+    """Analyze candidate with voice assistant"""
+    model = genai.GenerativeModel(
+        "gemini-2.0-flash",
+        generation_config=genai.GenerationConfig(
+            candidate_count=1,
+            top_p=0.7,
+            top_k=4,
+            max_output_tokens=2000,
+            temperature=0.7,
+        ),
+    )
+
+    initial_prompt = f"""
+    You are an AI HR assistant helping evaluate candidates. Please analyze this candidate profile:
+    
+    Name: {result_data['name']}
+    Match Score: {result_data['match_score']:.2f}%
+    Experience: {result_data['experience_years']} years
+    Skills: {', '.join(result_data['skills'])}
+    Education: {'; '.join(result_data['education'])}
+    
+    Provide insights in a natural conversational way. Focus on:
+    1. Overall match for the role
+    2. Key strengths and weaknesses
+    3. Areas to probe during interview
+    4. Hiring recommendation
+    """
+
+    chat = model.start_chat(history=[])
+    return chat, initial_prompt
+
+
+def text_to_speech(text, lang="en"):
+    """Convert text to speech"""
+    mp3file = BytesIO()
+    tts = gTTS(text=text, lang=lang)
+    tts.write_to_fp(mp3file)
+    mp3file.seek(0)
+
+    # Save to temp file since Streamlit's audio needs a file path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+        f.write(mp3file.read())
+        return f.name
+
+
+def speech_to_text():
+    """Convert speech to text using Google Speech Recognition"""
+    try:
+        r = sr.Recognizer()
+        with sr.Microphone() as source:
+            st.info("Listening... Please speak your question.")
+            r.adjust_for_ambient_noise(source)
+            audio = r.listen(source, timeout=5)
+            st.success("Got it! Processing your question...")
+
+            text = r.recognize_google(audio)
+            return text
+    except sr.WaitTimeoutError:
+        st.error("No speech detected. Please try again.")
+    except sr.UnknownValueError:
+        st.error("Could not understand the audio. Please try again.")
+    except sr.RequestError:
+        st.error(
+            "Could not reach the speech recognition service. Please check your internet connection."
+        )
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+    return None
+
+
+def get_voice_response(text, context=None, max_tokens=250):
+    """Get response from Gemini model with length limit"""
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        # Limit response length
+        prompt = f"Please provide a brief, helpful response in under {max_tokens} words: {text}"
+        if context:
+            prompt = f"""
+            Context: {context}
+            Question: {text}
+            Please provide a brief answer considering the context in under {max_tokens} words.
+            Stay focused on relevant, factual information.
+            """
+
+        # Generate response with basic error handling
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            # Handle specific API errors
+            error_msg = str(e).lower()
+            if "unsafe" in error_msg or "dangerous" in error_msg:
+                return "I cannot provide a response to that query. Please try asking something else."
+            else:
+                return f"Error generating response: {str(e)}"
+
+    except Exception as e:
+        return "Sorry, I encountered an error. Please try again."
+
+
+def voice_chat_interface():
+    """Updated voice chat interface with improved response handling"""
+    st.title("Voice Chat Interface")
+
+    # Initialize session state for conversation history
+    if "conversation_history" not in st.session_state:
+        st.session_state.conversation_history = []
+
+    # Resume selector for context
+    context = None
+    if "parsed_resumes" in st.session_state and st.session_state.parsed_resumes:
+        resume_options = [
+            f"{r['name']} - {r['filename']}" for r in st.session_state.parsed_resumes
+        ]
+        resume_options.insert(0, "General Chat (No Resume)")
+
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            selected_idx = st.selectbox(
+                "Select Resume for Context:",
+                range(len(resume_options)),
+                format_func=lambda x: resume_options[x],
+            )
+
+            if selected_idx > 0:
+                resume = st.session_state.parsed_resumes[selected_idx - 1]
+                context = f"""
+                Name: {resume['name']}
+                Experience: {resume['experience_years']} years
+                Skills: {', '.join(resume['skills'])}
+                Education: {'; '.join(resume['education'])}
+                """
+
+                with st.expander("Selected Resume Context"):
+                    st.info(context)
+
+            # Voice input button
+            if st.button("🎤 Start Voice Input"):
+                user_text = speech_to_text()
+
+                if user_text:
+                    st.write("You said:", user_text)
+
+                    with st.spinner("Getting response..."):
+                        try:
+                            # Get AI response with timeout
+                            response = get_voice_response(user_text, context)
+
+                            # Add to conversation history
+                            st.session_state.conversation_history.append(
+                                {"user": user_text, "assistant": response}
+                            )
+
+                            # Display text response immediately
+                            st.markdown("**AI Response:**")
+                            st.write(response)
+
+                            # Play audio in background thread
+                            threading.Thread(
+                                target=play_audio_response,
+                                args=(response,),
+                                daemon=True,
+                            ).start()
+
+                        except Exception as e:
+                            st.error(f"Error processing response: {str(e)}")
+
+        with col2:
+            # Display conversation history
+            st.subheader("Conversation History")
+            for exchange in st.session_state.conversation_history:
+                st.write("👤 You:", exchange["user"])
+                st.write("🤖 Assistant:", exchange["assistant"])
+                st.markdown("---")
+
+            # Clear history button
+            if st.button("Clear History"):
+                st.session_state.conversation_history = []
+                st.experimental_rerun()
+
+    else:
+        st.warning(
+            "Please upload and process resumes in the Resume Search tab first to enable resume context."
+        )
+
+
+def get_available_models():
+    """Get list of available models for vision analysis"""
+    return {
+        "Gemini Pro Vision": "gemini-pro-vision",
+        "LLaMA-2 Vision": "llama-3.2-90b-vision-preview",
+        "GPT-4 Vision": "gpt-4-vision-preview",
+    }
+
+
+def analyze_resume_with_vision(resume_content, candidate_info, selected_model):
+    """Analyze resume using selected vision model"""
+    # Convert text content to image
+    image = Image.new("RGB", (800, 1000), color="white")
+    d = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        font = None
+    d.text((20, 20), resume_content, fill="black", font=font)
+
+    # Save temp image
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format="PNG")
+    img_byte_arr = img_byte_arr.getvalue()
+    base64_image = base64.b64encode(img_byte_arr).decode("utf-8")
+
+    # Create vision prompt
+    vision_prompt = f"""Analyze this candidate's resume:
+    Name: {candidate_info['name']}
+    Match Score: {candidate_info['match_score']:.2f}%
+    
+    Please provide a detailed analysis focusing on:
+    1. Key qualifications and skills
+    2. Experience relevance
+    3. Education background
+    4. Areas to probe in interview
+    5. Hiring recommendation
+    6. Visual layout and presentation
+    """
+
+    try:
+        if "gemini" in selected_model:
+            # Use Gemini
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel(selected_model)
+            response = model.generate_content([vision_prompt, img_byte_arr])
+            return response.text
+        else:
+            # Use Groq
+            completion = groq_client.chat.completions.create(
+                model=selected_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=1024,
+            )
+            return completion.choices[0].message.content
+    except Exception as e:
+        return f"Error analyzing resume: {str(e)}"
 
 
 def main():
     st.set_page_config(page_title="Resume Search System", page_icon="📄", layout="wide")
 
-    # Initialize all session state variables        
+    # Initialize all session state variables
     if "api_key" not in st.session_state:
         st.session_state.api_key = GEMINI_API_KEY
     if "parsed_resumes" not in st.session_state:
@@ -1724,7 +2459,7 @@ def main():
         st.session_state.interview_questions = None
 
     # Create tabs for different functionalities
-    tabs = st.tabs(["Resume Search", "Mock Interview Questions"])
+    tabs = st.tabs(["Resume Search", "Mock Interview Questions", "Voice Chat"])
 
     with tabs[0]:  # Resume Search Tab
         st.title("Resume Search System with RAG")
@@ -1797,12 +2532,10 @@ def main():
                 placeholder="e.g., python, react, aws",
             )
 
-        with col2:
             min_experience = st.number_input(
-                "Minimum Experience (years):", min_value=0, value=0
+                "Minimum Years of Experience:", min_value=0, value=0, step=1
             )
 
-        with col3:
             education_filter = st.selectbox(
                 "Education Level:", options=["Any", "Bachelor", "Master", "PhD"]
             )
@@ -1895,106 +2628,114 @@ def main():
         # Display search results
         if st.session_state.search_results:
             st.header("Search Results")
-
             results = st.session_state.search_results
 
-            # Display summary and key insights if available
+            # Display overall summary if available
             if "summary" in results:
-                st.subheader("Summary Analysis")
-                st.write(results["summary"])
+                with st.expander("Analysis Summary", expanded=True):
+                    st.markdown(results["summary"])
+                    if "key_insights" in results:
+                        st.subheader("Key Insights")
+                        for insight in results["key_insights"]:
+                            st.markdown(f"• {insight}")
 
-            if (
-                "key_insights" in results
-                and results["key_insights"]
-                and results["key_insights"]
-            ):
-                st.subheader("Key Insights")
-                for insight in results["key_insights"]:
-                    st.markdown(f"• {insight}")
+            # Create dropdown for resume selection
+            resume_options = [
+                f"{r['name']} - {r['filename']} (Match: {r['match_score']:.2f}%)"
+                for r in results["results"]
+            ]
+            selected_resume = st.selectbox(
+                "Select a resume to analyze:", resume_options
+            )
 
-            st.subheader(f"Found {len(results['results'])} matching candidates")
+            # Get selected resume data
+            selected_idx = resume_options.index(selected_resume)
+            result = results["results"][selected_idx]
 
-            # Shortlist interface
-            st.write("Select candidates to shortlist:")
+            # Create three columns for better layout
+            col1, col2 = st.columns([1, 1])
 
-            # Create checkboxes for each result
-            selected_ids = []
+            with col1:
+                st.subheader("Basic Information")
+                st.write(f"**Name:** {result['name']}")
+                st.write(f"**Email:** {result['email']}")
+                st.write(f"**Phone:** {result['phone']}")
+                st.write(f"**Experience:** {result['experience_years']} years")
 
-            for result in results["results"]:
-                col1, col2 = st.columns([1, 10])
+                # Display skills with categories
+                st.write("**Skills:**")
+                if "domain_skills" in result:
+                    for domain, skills in result["domain_skills"].items():
+                        with st.expander(f"{domain.replace('_', ' ').title()} Skills"):
+                            st.write(", ".join(skills))
+                st.write("**General Skills:**")
+                st.write(", ".join(result["skills"]))
 
-                with col1:
-                    if st.checkbox("", key=f"select_{result['id']}"):
-                        selected_ids.append(result["id"])
+                st.write("**Education:**")
+                for edu in result["education"]:
+                    st.write(f"- {edu}")
 
-                with col2:
-                    with st.expander(
-                        f"{result['name']} - {result['filename']} - Match: {result['match_score']:.2f}%"
-                    ):
-                        st.write(f"**Email:** {result['email']}")
-                        st.write(f"**Phone:** {result['phone']}")
-                        st.write(f"**Experience:** {result['experience_years']} years")
+            with col2:
+                st.subheader("Analysis & Highlights")
 
-                        # Display positions if available
-                        if "positions" in result and result["positions"]:
-                            st.write("**Positions:**")
-                            for position in result["positions"]:
-                                st.write(
-                                    f"- {position['title']} ({position['date_range']})"
-                                )
+                # Display match score with color
+                score = result["match_score"]
+                score_color = (
+                    "green" if score >= 80 else "orange" if score >= 60 else "red"
+                )
+                st.markdown(
+                    f"**Match Score:** <span style='color:{score_color}'>{score:.1f}%</span>",
+                    unsafe_allow_html=True,
+                )
 
-                        st.write("**Skills:**")
-                        st.write(", ".join(result["skills"]))
+                # Display highlights
+                if "highlights" in result:
+                    st.write("**Key Highlights:**")
+                    for highlight in result["highlights"]:
+                        st.markdown(f"- {highlight}")
 
-                        st.write("**Education:**")
-                        for edu in result["education"]:
-                            st.write(f"- {edu}")
+                # Display positions if available
+                if "positions" in result and result["positions"]:
+                    st.write("**Work History:**")
+                    for pos in result["positions"]:
+                        st.markdown(f"- **{pos['title']}** ({pos['date_range']})")
 
-                        # Show additional context if available
-                        if "context" in result:
-                            st.write("**Additional Insights:**")
-                            context = result["context"]
-                            if context.get("has_recent_experience"):
-                                st.write("- ✅ Has recent experience (2023-2024)")
-                            if context.get("education_level") != "Unknown":
-                                st.write(
-                                    f"- 🎓 Highest education: {context.get('education_level')}"
-                                )
-                            if context.get("position_count", 0) > 1:
-                                st.write(
-                                    f"- 👔 Has {context.get('position_count')} different positions"
-                                )
+                # Add detailed analysis button
+                if st.button(
+                    "Generate Detailed Analysis", key=f"analyze_{result['id']}"
+                ):
+                    with st.spinner("Analyzing resume..."):
+                        # Get comprehensive analysis
+                        analysis = analyze_resume_with_vision(
+                            result.get("content", ""), result  # Use get() with fallback
+                        )
 
-                        st.write("**Highlights:**")
-                        for highlight in result["highlights"]:
-                            st.markdown(f"- _{highlight}_")
+                        if analysis:
+                            with st.expander("Detailed Analysis", expanded=True):
+                                sections = analysis.split("\n\n")
+                                for section in sections:
+                                    if section.strip():
+                                        title = (
+                                            section.split("\n")[0]
+                                            if ":" in section
+                                            else "Analysis"
+                                        )
+                                        content = (
+                                            "\n".join(section.split("\n")[1:])
+                                            if ":" in section
+                                            else section
+                                        )
+                                        st.markdown(f"**{title}**")
+                                        st.markdown(content)
+                                        st.markdown("---")
 
-            # Shortlist button
-            if st.button("Shortlist Selected Candidates"):
-                if not selected_ids:
-                    st.error("Please select at least one candidate to shortlist")
+            # Add to shortlist button
+            if st.button("Add to Shortlist", key=f"shortlist_{result['id']}"):
+                if result not in st.session_state.shortlisted:
+                    st.session_state.shortlisted.append(result)
+                    st.success(f"Added {result['name']} to shortlist!")
                 else:
-                    # Get selected candidates
-                    shortlisted = []
-
-                    for result in results["results"]:
-                        if result["id"] in selected_ids:
-                            shortlisted.append(result)
-
-                    # Store in session state
-                    st.session_state.shortlisted = shortlisted
-
-                    st.success(f"Shortlisted {len(shortlisted)} candidates")
-
-            # Display JSON output button
-            if st.button("Export Results as JSON"):
-                # Create JSON output
-                json_output = json.dumps(results, indent=2)
-
-                # Create download link
-                b64 = base64.b64encode(json_output.encode()).decode()
-                href = f'<a href="data:application/json;base64,{b64}" download="search_results.json">Download JSON</a>'
-                st.markdown(href, unsafe_allow_html=True)
+                    st.warning("This candidate is already shortlisted!")
 
         # Display shortlisted candidates
         if st.session_state.shortlisted:
@@ -2213,9 +2954,7 @@ def main():
 
                     if question_type == "Concept Questions":
                         for i, q in enumerate(st.session_state.interview_questions):
-                            with st.expander(
-                                f"Question {i+1}: {q['question'][:100]}..."
-                            ):
+                            with st.expander(f"Question {i+1}: {q['question']}..."):
                                 st.markdown(f"**{q['question']}**")
                                 st.markdown("#### Expected Answer:")
                                 st.markdown(q["answer"])
@@ -2265,6 +3004,9 @@ def main():
 
             except Exception as e:
                 st.error(f"Error processing the file: {str(e)}")
+
+    with tabs[2]:  # Voice Chat Tab
+        voice_chat_interface()
 
 
 if __name__ == "__main__":
